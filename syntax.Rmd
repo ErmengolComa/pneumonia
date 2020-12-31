@@ -1,0 +1,169 @@
+---
+title: "Resultats article pneumònies"
+output: html_notebook
+---
+
+```{r message=TRUE, warning=TRUE, include=FALSE}
+library("data.table")
+library("ggplot2")
+library("lubridate")
+library("kableExtra")
+library("forecast")
+library("gridExtra")
+```
+
+# Data 
+
+```{r}
+pneum <- fread("pneum.csv", header = T)
+pneum[, date := as.Date(date)]
+flu <- fread("flu.csv", header = T)
+flu[, date := as.Date(date)]
+covid <- fread("covid.csv", header = T)
+covid[, date := as.Date(date)]
+```
+
+# Descriptive
+
+```{r}
+pneum[, sum(N), c("age", "Season")]
+```
+
+```{r}
+picks_flu <- unique(pneum[flu_pick == 1 & age == "Total" & Season != "2020-2021", c("Season", "date", "flu_pick")])
+
+figure1 <- ggplot(pneum[Season != "2020-2021" & age == "Total"], aes(date, N7)) +
+  geom_vline(data = picks_flu, aes(xintercept = as.numeric(date)), linetype = 2) + 
+  geom_line(aes(group = Season, linetype = "Peak of flu epidemic")) +
+  geom_line(aes(group = Season, linetype = "New pneumonia cases")) +
+    scale_x_date(breaks = "2 month") +
+  scale_linetype_manual(values = c("New pneumonia cases" = 1, "Peak of flu epidemic" = 2)) +
+  # geom_smooth() +
+  theme_classic() +
+  theme(
+    axis.text.x = element_text(angle = 90, vjust = .5),
+    legend.position = "bottom") +
+  guides(alpha = "none")  +
+  labs(title = "", x = "", y = "Number of new pneumonia cases\n observed in a 7-day period", linetype = "") +
+  facet_wrap(~Season, scale = "free")
+
+ggsave(file="figure1.svg", plot = figure1, dpi = 600, width = 8, height = 8)
+```
+
+# Time series
+
+```{r}
+age_predictions <- function(d){
+  print(unique(d[, age]))
+
+  dades <- d[!Season %in% c("2018-2019", "2019-2020", "2020-2021"), c("date", "Season", "age", "N7.x", "N7.y")]
+  dades <- dades[order(date)]
+  
+
+  if (nrow(dades)>1){
+    ili_ts <- ts(dades$N7.x, frequency = 365)
+
+  ilifit <- tslm(ili_ts ~ season + N7.y, data = dades)
+  
+  noves_dades <- d[Season %in% c("2018-2019", "2019-2020", "2020-2021"), c("date", "Season", "age", "N7.x", "N7.y")]
+  noves_dades <- noves_dades[order(date)]
+
+  pred <- tryCatch(forecast(ilifit, newdata = noves_dades, level = c(80, 90, 95)), error=function(e) NULL)
+  
+if (!is.null(pred)){
+  dt_predict <- as.data.table(pred)
+  dt_predict[, date :=  seq(dades[, max(date)] + 1 , to = dades[, max(date)] + nrow(dt_predict), 1)]
+  dt_predict <- merge(dt_predict, d[,  c("date", "Season", "N7.x")], by = "date", all.x = T)
+  
+  dt_predict_casos <- dt_predict
+  dt_predict_casos[, age := unique(d$age)]
+  dt_predict_casos}
+  }
+}
+```
+
+```{r}
+pneum_flu <- merge(pneum, flu[, c("date", "age", "N7")], by = c("date", "age"), all.x = T)
+pneum_flu_split <- split(pneum_flu, f = pneum_flu[, age])
+
+prediccions <- lapply(pneum_flu_split, age_predictions)
+```
+
+```{r message=FALSE, warning=FALSE}
+dg <- do.call("rbind",
+  lapply(prediccions, function(x){
+    dg <- melt(x, id.vars = c("date", "Lo 95", "Hi 95", "age"), measure.vars = c("N7.x", "Point Forecast"))
+  dg[, variable := factor(variable, levels = c("Point Forecast", "N7.x"), labels = c("Expected", "Observed"))]
+}))
+dg[, age := factor(age, levels = c( "Total", "Younger than 15", "Between 15 and 64", "Older than 64"))]
+```
+
+```{r, fig.height=10, fig.width=8}
+figure2 <- ggplot(dg, aes(date)) +
+# ggplot(dg[data < today()], aes(data)) +
+  geom_line(aes(group = variable, y = value, linetype = variable)) +
+  geom_ribbon(aes(ymin = `Lo 95`, ymax = `Hi 95`), fill = "grey", alpha = .5) +
+  theme_classic() + labs(title = "", x = "Days", y = "New pneumonia cases in a 7-day period", linetype = "") +
+  # scale_x_date(breaks = "1 month") +
+  scale_x_date(breaks = "3 weeks") +
+  # geom_vline(xintercept = as.Date(c("2020-03-13", "2020-06-19")), linetype = 2) +
+  scale_linetype_manual(values = c("Expected" = 2, "Observed" = 1, "Pneumònies per COVID-19" = 3)) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = "bottom") + facet_wrap(~age, scales = "free_y", nrow = 4)
+
+ggsave(file="figure2.svg", plot = figure2, dpi = 600, width = 8, height = 10)
+
+
+```
+
+
+# Lack/excess
+
+
+```{r}
+prediccions_rbind <- do.call("rbind", prediccions)
+prediccions_rbind[, excess := ifelse(N7.x > `Hi 95`, 1, 0)]
+prediccions_rbind[, lack := ifelse(N7.x < `Lo 95`, 1, 0)]
+```
+
+```{r}
+library(dplyr)
+periodes_exces <- prediccions_rbind[excess == 1, 
+                                    .(start = min(date), 
+                                      end = max(date),
+                                      casos = paste0(format(round(sum(N7.x - `Point Forecast`)/7, 0), big.mark = ".", decimal.mark = ","), " [IC95%: ", format(round(sum(N7.x - `Hi 95`)/7, 0), big.mark = ".", decimal.mark = ","), " - ", format(round(sum(N7.x - `Lo 95`)/7, 0), big.mark = ".", decimal.mark = ","), "]"),
+                                      perc = paste0(format(sum(N7.x - `Point Forecast`)/sum(`Point Forecast`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " [IC95%: ", format(sum(N7.x - `Hi 95`)/sum(`Hi 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " - ", format(sum(N7.x - `Lo 95`)/sum(`Lo 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), "]")),
+   by = .(age, excess, g = cumsum(c(0, diff(date)) != 1))][order(start)]
+periodes_exces[, dies := end - start]
+# periodes_exces <- periodes_exces[dies != 0]
+
+periodes_defecte <- prediccions_rbind[lack == 1, 
+                                      .(start = min(date), 
+                                        end = max(date),
+                                        casos = paste0(format(round(sum(`Point Forecast` - N7.x)/7, 0), big.mark = ".", decimal.mark = ",", digits = 4), " [IC95%: ", format(round(sum(`Lo 95` - N7.x)/7, 0), big.mark = ".", decimal.mark = ",", digits = 4), " - ", format(round(sum(`Hi 95` - N7.x)/7, 0), big.mark = ".", decimal.mark = ",", digits = 4), "]"),
+                                      perc = paste0(format(sum(`Point Forecast` - N7.x)/sum(`Point Forecast`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " [IC95%: ", format(sum(`Lo 95` - N7.x)/sum(`Lo 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), " - ", format(sum(`Hi 95` - N7.x)/sum(`Hi 95`)*100, big.mark = ".", decimal.mark = ",", digits = 4), "]")),
+                                    by = .(age, lack, g = cumsum(c(0, diff(date)) != 1))][order(start)]
+periodes_defecte[, dies := end - start]
+# periodes_defecte <- periodes_defecte[dies != 0]
+
+fwrite(setorderv(periodes_exces, c("age", "start"))[, c(1, 4, 5, 6, 7, 8)], "taula_exces.csv", sep = ";", dec = ",", row.names = F)
+fwrite(setorderv(periodes_defecte, c("age", "start"))[, c(1, 4, 5, 6, 7, 8)], "taula_defecte.csv", sep = ";", dec = ",", row.names = F)
+```
+
+# Pneum vs COVID
+
+```{r, fig.height=10, fig.width=8}
+pneum[, age := factor(age, levels = c( "Total", "Younger than 15", "Between 15 and 64", "Older than 64"))]
+covid[, age := factor(age, levels = c( "Total", "Younger than 15", "Between 15 and 64", "Older than 64"))]
+figure3 <- ggplot(pneum[date >= min(covid[!is.na(covid7)]$date)], aes(x = date)) +
+  geom_line(aes(y = N7, linetype = "Pneumonia")) +
+  geom_line(data = covid, aes(y = covid7/10 , linetype = "COVID-19")) +
+  theme_classic() + labs(title = "", x = "Days", y = "Pneumonia", linetype = "") +
+  scale_x_date(breaks = "10 days") +
+  scale_y_continuous(sec.axis = sec_axis(~.*10, name="COVID-19")) +
+  theme(axis.text.x = element_text(angle = 90, vjust = .5),
+        legend.position = "bottom") + facet_wrap(~age, scales = "free_y", nrow = 4)
+
+ggsave(file="figure3.svg", plot = figure3, dpi = 600, width = 8, height = 10)
+
+```
